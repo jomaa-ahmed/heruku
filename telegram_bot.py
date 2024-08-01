@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 import logging
 from flask import Flask, request
-from bot import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram_bot import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackContext, Updater, ConversationHandler
 from dotenv import load_dotenv
 from threading import Thread
