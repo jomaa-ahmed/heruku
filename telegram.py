@@ -1,81 +1,76 @@
+import os
 import imaplib
 import email
 from email.header import decode_header
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 import logging
-import os
+from flask import Flask, request
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackContext, Updater, ConversationHandler
 from dotenv import load_dotenv
-from flask import Flask, jsonify
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
+from threading import Thread
+import requests
+import time
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Get credentials and token from environment variables
+# Retrieve environment variables
 EMAIL_USER = os.getenv('EMAIL_USER')
 EMAIL_PASS = os.getenv('EMAIL_PASS')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 
+# Ensure the environment variables are loaded correctly
 if not all([EMAIL_USER, EMAIL_PASS, TELEGRAM_TOKEN]):
-    raise ValueError("Please set the EMAIL_USER, EMAIL_PASS, and TELEGRAM_TOKEN environment variables.")
+    raise ValueError("Missing one or more environment variables: EMAIL_USER, EMAIL_PASS, TELEGRAM_TOKEN")
 
 # Initialize Telegram bot
 bot = Bot(token=TELEGRAM_TOKEN)
 
+# Set up Flask
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Hello, this is the Telegram bot server."
+
 # Conversation states
-EMAIL, CHECK_EMAIL = range(2)
+PROFILE_NAME = range(1)
 
 def start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text('Please enter the password:')
-    return EMAIL
+    update.message.reply_text('👤 من فضلك أدخل اسم الملف الشخصي:')
+    return PROFILE_NAME
 
-def receive_email(update: Update, context: CallbackContext) -> int:
-    password = update.message.text
-    if password == "123":
-        update.message.reply_text("Checking for codes or links...")
-        check_for_codes_and_links(update, context)
+def receive_profile_name(update: Update, context: CallbackContext) -> int:
+    profile_name = update.message.text
+    context.user_data['profile_name'] = profile_name
+    update.message.reply_text(f"🔍 جاري التحقق من الروابط والأكواد لحساب {profile_name}...")
+    emails_info = get_emails_info(profile_name)
+    if emails_info:
+        for email_info in emails_info:
+            send_telegram_message(update.message.chat_id,
+                                  email_info['profile_name'],
+                                  email_info['link'], email_info['time_ago'],
+                                  email_info['type'])
+        update.message.reply_text("✅ تم الانتهاء. اكتب /start للبدء من جديد.")
     else:
-        update.message.reply_text("Incorrect password. Please try again.")
-        return EMAIL
-    return CHECK_EMAIL
-
-def check_for_codes_and_links(update: Update, context: CallbackContext) -> None:
-    chat_id = update.message.chat_id
-    try:
-        emails_info = get_emails_info()
-        if emails_info:
-            for email_info in emails_info:
-                send_telegram_message(
-                    chat_id,
-                    email_info['profile_name'],
-                    email_info['link'],
-                    email_info['time_ago'],
-                    email_info['type']
-                )
-        else:
-            update.message.reply_text("No codes or links available.")
-    except Exception as e:
-        logging.error(f"An error occurred while checking emails: {e}")
-        update.message.reply_text("An error occurred while checking emails.")
-    finally:
-        update.message.reply_text("Type /start to check again.")
+        update.message.reply_text("❌ لا توجد أكواد أو روابط متاحة.")
     return ConversationHandler.END
 
 def send_telegram_message(chat_id, profile_name, link, time_ago_str, email_type):
-    message = f"👤 <b>Profile:</b> {profile_name}\n📄 <b>Type:</b> {email_type}\n⏰ <b>Time:</b> {time_ago_str}"
-    button = InlineKeyboardButton(text="🔗 Click here", url=link)
+    message = f"👤 <b>الملف الشخصي:</b> {profile_name}\n📄 <b>النوع:</b> {email_type}\n⏰ <b>الوقت:</b> {time_ago_str}"
+    button = InlineKeyboardButton(text="🔗 اضغط هنا", url=link)
     keyboard = InlineKeyboardMarkup([[button]])
     try:
-        bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML', reply_markup=keyboard)
+        bot.send_message(chat_id=chat_id,
+                         text=message,
+                         parse_mode='HTML',
+                         reply_markup=keyboard)
     except Exception as e:
         logging.error(f"Failed to send message via Telegram: {e}")
 
-def get_emails_info():
+def get_emails_info(profile_name_filter=None):
     try:
         # Connect to the server
         logging.info("Connecting to email server")
@@ -131,8 +126,8 @@ def get_emails_info():
 
             time_ago = (now - date).total_seconds()
             time_ago_str = (
-                f"{int(time_ago // 60)} minutes ago" if time_ago < 3600 else
-                f"{int(time_ago // 3600)} hours ago"
+                f"{int(time_ago // 60)} دقائق مضت" if time_ago < 3600 else
+                f"{int(time_ago // 3600)} ساعات مضت"
             )
 
             body = None
@@ -159,8 +154,10 @@ def get_emails_info():
             if body:
                 # Extract the profile name and code link
                 profile_name = extract_profile_name(body)
+                if profile_name_filter and profile_name_filter.lower() not in profile_name.lower():
+                    continue
                 soup = BeautifulSoup(body, 'html.parser')
-                link = soup.find('a', string=["Get Code", "Récupérer le code", "Yes, This Was Me", "Oui, c'était moi"])
+                link = soup.find('a', string=["Get Code", "Récupérer le code", "Yes, This Was Me", "Confirm Update"])
                 if link and link['href']:
                     email_info = {
                         "profile_name": profile_name if profile_name else "Unknown",
@@ -185,37 +182,36 @@ def get_emails_info():
 def extract_profile_name(body):
     # Use BeautifulSoup to parse the HTML content
     soup = BeautifulSoup(body, 'html.parser')
-    
+
     # Look for patterns that likely contain the profile name in all cases
     requested_by = soup.find(string=lambda text: text and ("Requested by" in text or "Demande effectuée par" in text))
     if requested_by:
-        # Extract the name following "Requested by" or "Demande effectuée par"
+        # Extract the name following "by" or "par"
         start = requested_by.find("by") + len("by ") if "by" in requested_by else requested_by.find("par") + len("par ")
         end = requested_by.find(" ", start)
         if end == -1:
             end = len(requested_by)
         profile_name = requested_by[start:end].strip()
         return profile_name
-    
-    return None
 
-app = Flask(__name__)
+    return "Unknown"
 
-@app.route("/")
-def index():
-    profile_name_filter = None  # Adjust as needed
-    emails_info = get_emails_info()
-    return jsonify(emails_info)
+# Function to run the Flask app
+def run_flask():
+    app.run(host="0.0.0.0", port=8080)
 
-def main() -> None:
-    updater = Updater(TELEGRAM_TOKEN)
+# Function to run the Telegram bot
+def run_telegram():
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
     dispatcher = updater.dispatcher
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
-            EMAIL: [MessageHandler(Filters.text & ~Filters.command, receive_email)],
-            CHECK_EMAIL: [MessageHandler(Filters.text & ~Filters.command, receive_email)]
+            PROFILE_NAME: [
+                MessageHandler(Filters.text & ~Filters.command,
+                               receive_profile_name)
+            ],
         },
         fallbacks=[CommandHandler('start', start)],
     )
@@ -224,5 +220,7 @@ def main() -> None:
     updater.start_polling()
     updater.idle()
 
-if __name__ == '__main__':
-    main()
+# Start both Flask app and Telegram bot in separate threads
+if __name__ == "__main__":
+    Thread(target=run_flask).start()
+    Thread(target=run_telegram).start()
